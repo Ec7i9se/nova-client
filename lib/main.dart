@@ -1,12 +1,17 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:nova/firebase_options.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-void main() {
-  // WidgetsFlutterBinding.ensureInitialized();
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const MyApp());
 }
 
@@ -34,7 +39,8 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
-  static const String _initialUrl = 'https://demo.footy.gg';
+  static const String _baseUrl = 'https://novagame.io';
+  static const String _initialUrl = '$_baseUrl/login';
 
   late final WebViewController _controller;
   String? _loadError;
@@ -83,7 +89,28 @@ class _MainScreenState extends State<MainScreen> {
           },
         ),
       );
+    _requestNotificationPermission();
     _loadWithSavedCookies();
+  }
+
+  Future<void> _requestNotificationPermission() async {
+    final messaging = FirebaseMessaging.instance;
+    final settings = await messaging.requestPermission();
+    debugPrint('Notification permission: ${settings.authorizationStatus}');
+    if (settings.authorizationStatus == AuthorizationStatus.authorized ||
+        settings.authorizationStatus == AuthorizationStatus.provisional) {
+      if (_authToken != null) {
+        try {
+          final decoded = jsonDecode(_authToken!) as Map<String, dynamic>?;
+          final accessToken = decoded?['access_token'] as String?;
+          if (accessToken != null && accessToken.isNotEmpty) {
+            await _sendFcmTokenToServer(accessToken);
+          }
+        } catch (e) {
+          debugPrint('Failed to parse auth token after permission grant: $e');
+        }
+      }
+    }
   }
 
   Future<void> _loadWithSavedCookies() async {
@@ -140,18 +167,52 @@ class _MainScreenState extends State<MainScreen> {
       );
       final raw = result is String ? result : result.toString();
       // runJavaScriptReturningResult wraps strings in quotes on some platforms
-      final json = raw.replaceAll(RegExp(r'^"|"$'), '').trim();
-      if (json.isEmpty) return;
+      final jsonStr = raw.replaceAll(RegExp(r'^"|"$'), '').trim();
+      if (jsonStr.isEmpty) return;
 
-      print(json);
-      if (mounted) setState(() => _authToken = json);
+      if (mounted) setState(() => _authToken = jsonStr);
 
       final dir = await getApplicationDocumentsDirectory();
       final file = File('${dir.path}/authtoken.json');
-      await file.writeAsString(json);
+      await file.writeAsString(jsonStr);
       debugPrint('Auth token saved to ${file.path}');
+
+      final decoded = jsonDecode(jsonStr) as Map<String, dynamic>?;
+      final accessToken = decoded?['access_token'] as String?;
+      if (accessToken != null && accessToken.isNotEmpty) {
+        final settings = await FirebaseMessaging.instance.getNotificationSettings();
+        if (settings.authorizationStatus == AuthorizationStatus.authorized ||
+            settings.authorizationStatus == AuthorizationStatus.provisional) {
+          await _sendFcmTokenToServer(accessToken);
+        }
+      }
     } catch (e) {
       debugPrint('Failed to read auth token: $e');
+    }
+  }
+
+  Future<void> _sendFcmTokenToServer(String accessToken) async {
+    try {
+      final apnsToken = await FirebaseMessaging.instance.getAPNSToken();
+      print(apnsToken);
+      final fcmToken = await FirebaseMessaging.instance.getToken();
+      print(fcmToken);
+      if (fcmToken == null) {
+        debugPrint('FCM token not available');
+        return;
+      }
+      final uri = Uri.parse('$_baseUrl/api/push/token');
+      final client = HttpClient();
+      final request = await client.postUrl(uri);
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $accessToken');
+      request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      final body = jsonEncode({'token': fcmToken});
+      request.write(body);
+      final response = await request.close();
+      debugPrint('FCM token sent, status: ${response.statusCode}');
+      client.close();
+    } catch (e) {
+      debugPrint('Failed to send FCM token: $e');
     }
   }
 
