@@ -48,6 +48,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   String? _loadError;
   String? _authToken;
   bool _hasNotificationPermission = false;
+  bool _hasAskedNotificationPermission = false;
   bool _isRegisteringPushToken = false;
   String? _lastRegisteredFcmToken;
   StreamSubscription<String>? _tokenRefreshSubscription;
@@ -104,7 +105,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         debugPrint('FCM token refresh failed: $error');
       },
     );
-    _requestNotificationPermission();
     _startAuthTokenPolling();
     _loadWithSavedCookies();
   }
@@ -122,21 +122,35 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _readAuthToken();
       _startAuthTokenPolling();
-      _tryRegisterPushToken(reason: 'app resumed');
+      _ensureNotificationPermissionAndRegister(reason: 'app resumed');
     }
   }
 
-  Future<void> _requestNotificationPermission() async {
+  Future<void> _ensureNotificationPermissionAndRegister({String reason = 'manual'}) async {
+    final authToken = _authToken;
+    if (authToken == null || authToken.isEmpty) {
+      debugPrint('Skipping notification permission ($reason): auth token is not ready');
+      return;
+    }
+
     final messaging = FirebaseMessaging.instance;
-    final settings = await messaging.requestPermission(
-      alert: true,
-      badge: true,
-      sound: true,
-    );
+    var settings = await messaging.getNotificationSettings();
+
+    if (!_isNotificationPermissionGranted(settings) &&
+        settings.authorizationStatus != AuthorizationStatus.denied &&
+        !_hasAskedNotificationPermission) {
+      _hasAskedNotificationPermission = true;
+      settings = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+    }
+
     debugPrint('Notification permission: ${settings.authorizationStatus}');
     _hasNotificationPermission = _isNotificationPermissionGranted(settings);
     if (_hasNotificationPermission) {
-      await _tryRegisterPushToken(reason: 'permission granted');
+      await _tryRegisterPushToken(reason: reason);
     }
   }
 
@@ -194,7 +208,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _authTokenPollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       attempts += 1;
       await _readAuthToken();
-      await _tryRegisterPushToken(reason: 'auth token polling');
+      await _ensureNotificationPermissionAndRegister(reason: 'auth token polling');
 
       if (_lastRegisteredFcmToken != null || attempts >= 60) {
         timer.cancel();
@@ -271,7 +285,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       await file.writeAsString(jsonStr);
       debugPrint('Auth token saved to ${file.path}');
 
-      await _tryRegisterPushToken(reason: 'auth token read');
+      await _ensureNotificationPermissionAndRegister(reason: 'auth token read');
     } catch (e) {
       debugPrint('Failed to read auth token: $e');
     }
