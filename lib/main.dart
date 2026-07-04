@@ -270,7 +270,29 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _readAuthToken() async {
     try {
       final result = await _controller.runJavaScriptReturningResult(
-        "localStorage.getItem('$_supabaseAuthTokenKey') || ''",
+        '''
+        (() => {
+          const exactKey = '$_supabaseAuthTokenKey';
+          const storages = [window.localStorage, window.sessionStorage].filter(Boolean);
+
+          for (const storage of storages) {
+            const exactValue = storage.getItem(exactKey);
+            if (exactValue) return exactValue;
+          }
+
+          for (const storage of storages) {
+            for (let i = 0; i < storage.length; i += 1) {
+              const key = storage.key(i);
+              if (key && key.startsWith('sb-') && key.endsWith('-auth-token')) {
+                const value = storage.getItem(key);
+                if (value) return value;
+              }
+            }
+          }
+
+          return '';
+        })()
+        ''',
       );
       final jsonStr = _normalizeJavaScriptStringResult(result);
       if (jsonStr.isEmpty) return;
