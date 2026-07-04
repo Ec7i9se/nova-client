@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -38,18 +39,26 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const String _baseUrl = 'https://novagame.io';
   static const String _initialUrl = '$_baseUrl/login';
+  static const String _supabaseAuthTokenKey = 'sb-xsrwligqdlmkyqdsczru-auth-token';
 
   late final WebViewController _controller;
   String? _loadError;
   String? _authToken;
+  bool _hasNotificationPermission = false;
+  bool _hasAskedNotificationPermission = false;
+  bool _isRegisteringPushToken = false;
+  String? _lastRegisteredFcmToken;
+  StreamSubscription<String>? _tokenRefreshSubscription;
+  Timer? _authTokenPollTimer;
   final WebViewCookieManager _cookieManager = WebViewCookieManager();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     SystemChrome.setSystemUIOverlayStyle(
       const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
@@ -73,6 +82,7 @@ class _MainScreenState extends State<MainScreen> {
             if (mounted) setState(() => _loadError = null);
             _saveCookiesToFile(url);
             _readAuthToken();
+            _startAuthTokenPolling();
           },
           onWebResourceError: (WebResourceError error) {
             print('onWebResourceError: ${error.description}');
@@ -89,27 +99,58 @@ class _MainScreenState extends State<MainScreen> {
           },
         ),
       );
-    _requestNotificationPermission();
+    _tokenRefreshSubscription = FirebaseMessaging.instance.onTokenRefresh.listen(
+      (String token) => _tryRegisterPushToken(fcmToken: token, reason: 'token refresh'),
+      onError: (Object error) {
+        debugPrint('FCM token refresh failed: $error');
+      },
+    );
+    _startAuthTokenPolling();
     _loadWithSavedCookies();
   }
 
-  Future<void> _requestNotificationPermission() async {
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _tokenRefreshSubscription?.cancel();
+    _authTokenPollTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _readAuthToken();
+      _startAuthTokenPolling();
+      _ensureNotificationPermissionAndRegister(reason: 'app resumed');
+    }
+  }
+
+  Future<void> _ensureNotificationPermissionAndRegister({String reason = 'manual'}) async {
+    final authToken = _authToken;
+    if (authToken == null || authToken.isEmpty) {
+      debugPrint('Skipping notification permission ($reason): auth token is not ready');
+      return;
+    }
+
     final messaging = FirebaseMessaging.instance;
-    final settings = await messaging.requestPermission();
+    var settings = await messaging.getNotificationSettings();
+
+    if (!_isNotificationPermissionGranted(settings) &&
+        settings.authorizationStatus != AuthorizationStatus.denied &&
+        !_hasAskedNotificationPermission) {
+      _hasAskedNotificationPermission = true;
+      settings = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+    }
+
     debugPrint('Notification permission: ${settings.authorizationStatus}');
-    if (settings.authorizationStatus == AuthorizationStatus.authorized ||
-        settings.authorizationStatus == AuthorizationStatus.provisional) {
-      if (_authToken != null) {
-        try {
-          final decoded = jsonDecode(_authToken!) as Map<String, dynamic>?;
-          final accessToken = decoded?['access_token'] as String?;
-          if (accessToken != null && accessToken.isNotEmpty) {
-            await _sendFcmTokenToServer(accessToken);
-          }
-        } catch (e) {
-          debugPrint('Failed to parse auth token after permission grant: $e');
-        }
-      }
+    _hasNotificationPermission = _isNotificationPermissionGranted(settings);
+    if (_hasNotificationPermission) {
+      await _tryRegisterPushToken(reason: reason);
     }
   }
 
@@ -157,19 +198,108 @@ class _MainScreenState extends State<MainScreen> {
     _applySavedCookies(Uri.parse(_initialUrl)).then((_) {
       if (mounted) _controller.loadRequest(Uri.parse(_initialUrl));
     });
+    _startAuthTokenPolling();
+  }
+
+  void _startAuthTokenPolling() {
+    _authTokenPollTimer?.cancel();
+
+    var attempts = 0;
+    _authTokenPollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+      attempts += 1;
+      await _readAuthToken();
+      await _ensureNotificationPermissionAndRegister(reason: 'auth token polling');
+
+      if (_lastRegisteredFcmToken != null || attempts >= 60) {
+        timer.cancel();
+        if (identical(_authTokenPollTimer, timer)) {
+          _authTokenPollTimer = null;
+        }
+      }
+    });
+  }
+
+  bool _isNotificationPermissionGranted(NotificationSettings settings) {
+    return settings.authorizationStatus == AuthorizationStatus.authorized ||
+        settings.authorizationStatus == AuthorizationStatus.provisional;
+  }
+
+  String _currentPlatform() {
+    if (Platform.isIOS) return 'ios';
+    if (Platform.isAndroid) return 'android';
+    if (Platform.isMacOS) return 'macos';
+    if (Platform.isWindows) return 'windows';
+    if (Platform.isLinux) return 'linux';
+    return 'unknown';
+  }
+
+  String _normalizeJavaScriptStringResult(Object? result) {
+    var raw = result is String ? result : result?.toString() ?? '';
+    raw = raw.trim();
+
+    for (var i = 0; i < 2; i += 1) {
+      if (raw.isEmpty || raw == 'null' || raw == 'undefined') return '';
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is String) {
+          raw = decoded.trim();
+          continue;
+        }
+      } catch (_) {
+        // Some WebView implementations return the raw string, not JSON.
+      }
+      break;
+    }
+
+    return raw.replaceAll(RegExp(r'^"|"$'), '').trim();
+  }
+
+  String? _extractAccessToken(String authTokenJson) {
+    try {
+      final decoded = jsonDecode(authTokenJson);
+      if (decoded is Map<String, dynamic>) {
+        final accessToken = decoded['access_token'];
+        if (accessToken is String && accessToken.isNotEmpty) return accessToken;
+      }
+    } catch (e) {
+      debugPrint('Failed to parse auth token: $e');
+    }
+    return null;
   }
 
   Future<void> _readAuthToken() async {
-    const key = 'sb-xsrwligqdlmkyqdsczru-auth-token';
     try {
       final result = await _controller.runJavaScriptReturningResult(
-        "localStorage.getItem('$key') || ''",
+        '''
+        (() => {
+          const exactKey = '$_supabaseAuthTokenKey';
+          const storages = [window.localStorage, window.sessionStorage].filter(Boolean);
+
+          for (const storage of storages) {
+            const exactValue = storage.getItem(exactKey);
+            if (exactValue) return exactValue;
+          }
+
+          for (const storage of storages) {
+            for (let i = 0; i < storage.length; i += 1) {
+              const key = storage.key(i);
+              if (key && key.startsWith('sb-') && key.endsWith('-auth-token')) {
+                const value = storage.getItem(key);
+                if (value) return value;
+              }
+            }
+          }
+
+          return '';
+        })()
+        ''',
       );
-      final raw = result is String ? result : result.toString();
-      // runJavaScriptReturningResult wraps strings in quotes on some platforms
-      final jsonStr = raw.replaceAll(RegExp(r'^"|"$'), '').trim();
+      final jsonStr = _normalizeJavaScriptStringResult(result);
       if (jsonStr.isEmpty) return;
 
+      if (_authToken != jsonStr) {
+        _lastRegisteredFcmToken = null;
+      }
       if (mounted) setState(() => _authToken = jsonStr);
 
       final dir = await getApplicationDocumentsDirectory();
@@ -177,42 +307,81 @@ class _MainScreenState extends State<MainScreen> {
       await file.writeAsString(jsonStr);
       debugPrint('Auth token saved to ${file.path}');
 
-      final decoded = jsonDecode(jsonStr) as Map<String, dynamic>?;
-      final accessToken = decoded?['access_token'] as String?;
-      if (accessToken != null && accessToken.isNotEmpty) {
-        final settings = await FirebaseMessaging.instance.getNotificationSettings();
-        if (settings.authorizationStatus == AuthorizationStatus.authorized ||
-            settings.authorizationStatus == AuthorizationStatus.provisional) {
-          await _sendFcmTokenToServer(accessToken);
-        }
-      }
+      await _ensureNotificationPermissionAndRegister(reason: 'auth token read');
     } catch (e) {
       debugPrint('Failed to read auth token: $e');
     }
   }
 
-  Future<void> _sendFcmTokenToServer(String accessToken) async {
+  Future<void> _tryRegisterPushToken({String? fcmToken, String reason = 'manual'}) async {
+    if (_isRegisteringPushToken) return;
+
+    final authToken = _authToken;
+    if (authToken == null || authToken.isEmpty) {
+      debugPrint('Skipping FCM registration ($reason): auth token is not ready');
+      return;
+    }
+
+    final accessToken = _extractAccessToken(authToken);
+    if (accessToken == null || accessToken.isEmpty) {
+      debugPrint('Skipping FCM registration ($reason): access token is missing');
+      return;
+    }
+
+    final settings = await FirebaseMessaging.instance.getNotificationSettings();
+    _hasNotificationPermission = _isNotificationPermissionGranted(settings);
+    if (!_hasNotificationPermission) {
+      debugPrint('Skipping FCM registration ($reason): notification permission is not granted');
+      return;
+    }
+
+    _isRegisteringPushToken = true;
     try {
-      final apnsToken = await FirebaseMessaging.instance.getAPNSToken();
-      print(apnsToken);
-      final fcmToken = await FirebaseMessaging.instance.getToken();
-      print(fcmToken);
-      if (fcmToken == null) {
+      if (Platform.isIOS) {
+        final apnsToken = await FirebaseMessaging.instance.getAPNSToken();
+        if (apnsToken == null) {
+          debugPrint('Skipping FCM registration ($reason): APNS token is not available yet');
+          return;
+        }
+      }
+
+      final token = fcmToken ?? await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) {
         debugPrint('FCM token not available');
         return;
       }
+      if (_lastRegisteredFcmToken == token) {
+        debugPrint('FCM token already registered ($reason)');
+        return;
+      }
+
       final uri = Uri.parse('$_baseUrl/api/push/token');
       final client = HttpClient();
-      final request = await client.postUrl(uri);
-      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $accessToken');
-      request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
-      final body = jsonEncode({'token': fcmToken});
-      request.write(body);
-      final response = await request.close();
-      debugPrint('FCM token sent, status: ${response.statusCode}');
-      client.close();
+      try {
+        final request = await client.postUrl(uri);
+        request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $accessToken');
+        request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+        request.write(jsonEncode({
+          'token': token,
+          'platform': _currentPlatform(),
+        }));
+
+        final response = await request.close();
+        final responseBody = await utf8.decodeStream(response);
+        debugPrint('FCM token registration ($reason) status: ${response.statusCode}');
+
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          _lastRegisteredFcmToken = token;
+        } else {
+          debugPrint('FCM token registration failed: $responseBody');
+        }
+      } finally {
+        client.close(force: true);
+      }
     } catch (e) {
       debugPrint('Failed to send FCM token: $e');
+    } finally {
+      _isRegisteringPushToken = false;
     }
   }
 
