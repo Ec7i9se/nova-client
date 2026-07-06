@@ -41,7 +41,6 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const String _baseUrl = 'https://novagame.io';
-  static const String _initialUrl = '$_baseUrl/login';
   static const String _supabaseAuthTokenKey = 'sb-xsrwligqdlmkyqdsczru-auth-token';
 
   late final WebViewController _controller;
@@ -155,10 +154,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _loadWithSavedCookies() async {
-    final uri = Uri.parse(_initialUrl);
+    final uri = _initialLoginUri();
     await _applySavedCookies(uri);
     if (!mounted) return;
     _controller.loadRequest(uri);
+  }
+
+  Uri _initialLoginUri() {
+    return Uri.parse('$_baseUrl/login').replace(
+      queryParameters: {
+        'mobile_app': '1',
+        'cache_bust': DateTime.now().millisecondsSinceEpoch.toString(),
+      },
+    );
   }
 
   Future<void> _applySavedCookies(Uri targetUri) async {
@@ -195,8 +203,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   void _retry() {
     setState(() => _loadError = null);
-    _applySavedCookies(Uri.parse(_initialUrl)).then((_) {
-      if (mounted) _controller.loadRequest(Uri.parse(_initialUrl));
+    final uri = _initialLoginUri();
+    _applySavedCookies(uri).then((_) {
+      if (mounted) _controller.loadRequest(uri);
     });
     _startAuthTokenPolling();
   }
